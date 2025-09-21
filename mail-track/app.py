@@ -2,26 +2,42 @@ from flask import Flask, request, g, render_template_string, redirect, url_for, 
 import sqlite3
 from datetime import datetime
 import os
+import psycopg2
+from urllib.parse import urlparse
 
 # --- Configuration Production ---
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'votre_cle_secrete_tres_longue_ici_changez_moi_123456')
 
-# --- Chemin base de données SQLite ---
-DATABASE_PATH = os.path.join(os.path.dirname(__file__), 'reponses.db')
+# --- Configuration de la base de données (SQLite en local, PostgreSQL sur Cyclic) ---
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 # --- Identifiants admin ---
 ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
 ADMIN_PASS = os.environ.get('ADMIN_PASS', 'ChangezMoi123!')  # 🔒 À CHANGER
 
-# --- Connexion à la DB SQLite ---
+# --- Connexion à la DB ---
 def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         try:
-            db = g._database = sqlite3.connect(DATABASE_PATH)
-            db.row_factory = sqlite3.Row
-            print("✅ Connexion à SQLite réussie")
+            if DATABASE_URL:
+                # PostgreSQL (production)
+                parsed_url = urlparse(DATABASE_URL)
+                db = g._database = psycopg2.connect(
+                    database=parsed_url.path[1:],
+                    user=parsed_url.username,
+                    password=parsed_url.password,
+                    host=parsed_url.hostname,
+                    port=parsed_url.port
+                )
+                print("✅ Connexion à PostgreSQL réussie")
+            else:
+                # SQLite (développement local)
+                db_path = os.path.join(os.path.dirname(__file__), 'reponses.db')
+                db = g._database = sqlite3.connect(db_path)
+                db.row_factory = sqlite3.Row
+                print("✅ Connexion à SQLite réussie")
         except Exception as e:
             print(f"❌ Erreur de connexion à la base de données: {e}")
             raise
@@ -30,23 +46,38 @@ def get_db():
 # --- Initialisation DB ---
 def init_db():
     try:
-        db = sqlite3.connect(DATABASE_PATH)
+        db = get_db()
         cursor = db.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS responses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                candidate TEXT,
-                status TEXT,
-                email_id TEXT UNIQUE,
-                source TEXT,
-                ip TEXT,
-                user_agent TEXT,
-                date TEXT
-            )
-        """)
+        
+        if DATABASE_URL:  # PostgreSQL
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS responses (
+                    id SERIAL PRIMARY KEY,
+                    candidate TEXT,
+                    status TEXT,
+                    email_id TEXT UNIQUE,
+                    source TEXT,
+                    ip TEXT,
+                    user_agent TEXT,
+                    date TEXT
+                )
+            """)
+        else:  # SQLite
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS responses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    candidate TEXT,
+                    status TEXT,
+                    email_id TEXT UNIQUE,
+                    source TEXT,
+                    ip TEXT,
+                    user_agent TEXT,
+                    date TEXT
+                )
+            """)
+        
         db.commit()
         cursor.close()
-        db.close()
         print("✅ Table 'responses' créée ou déjà existante")
     except Exception as e:
         print(f"❌ Erreur lors de l'initialisation de la base de données: {e}")
@@ -135,12 +166,12 @@ def response():
         cursor = db.cursor()
 
         # Supprimer ancienne réponse pour ce mail
-        cursor.execute("DELETE FROM responses WHERE email_id = ?", (email_id,))
+        cursor.execute("DELETE FROM responses WHERE email_id = %s", (email_id,))
         db.commit()
 
         now = datetime.now().isoformat(sep=" ", timespec="seconds")
         cursor.execute(
-            "INSERT INTO responses (candidate, status, email_id, source, ip, user_agent, date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO responses (candidate, status, email_id, source, ip, user_agent, date) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (candidate, status, email_id, source, ip, ua, now)
         )
         db.commit()
@@ -200,7 +231,16 @@ def responses():
         db = get_db()
         cursor = db.cursor()
         cursor.execute("SELECT * FROM responses ORDER BY id DESC")
-        rows = cursor.fetchall()
+        
+        # Récupération des résultats selon le type de base de données
+        if DATABASE_URL:  # PostgreSQL
+            rows = cursor.fetchall()
+            # Convertir en format similaire à sqlite3.Row
+            columns = [desc[0] for desc in cursor.description]
+            rows = [dict(zip(columns, row)) for row in rows]
+        else:  # SQLite
+            rows = cursor.fetchall()
+            
     except Exception as e:
         print(f"❌ Erreur lors de la récupération des données: {e}")
         rows = []
@@ -267,7 +307,6 @@ def responses():
 # --- Lancement ---
 if __name__ == "__main__":
     print("🚀 Démarrage de l'application...")
-    print(f"📊 Base de données: {DATABASE_PATH}")
     init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
